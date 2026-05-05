@@ -35,6 +35,7 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, validator
+from sklearn.preprocessing import MinMaxScaler
 
 # TensorFlow imports (lazy loading to speed up startup)
 import tensorflow as tf
@@ -63,6 +64,7 @@ APP_CONFIG = {
     'data_path': 'data/dakshina_kannada_weather.csv',
     'models_dir': 'models',
     'scaler_path': 'models/scaler.pkl',
+    'target_scaler_path': 'models/target_scaler.pkl',
     'metrics_path': 'models/metrics.json',
     'sample_predictions_path': 'data/sample_predictions.json',
 }
@@ -196,6 +198,7 @@ class AppState:
     def __init__(self):
         self.models: Dict[str, tf.keras.Model] = {}
         self.scaler: Optional[MinMaxScaler] = None
+        self.target_scaler: Optional[MinMaxScaler] = None
         self.metrics: Dict[str, Dict] = {}
         self.df_historical: Optional[pd.DataFrame] = None
         self.feature_columns: List[str] = []
@@ -214,13 +217,21 @@ class AppState:
             else:
                 logger.warning(f"⚠️ Metrics file not found: {metrics_path}")
             
-            # Load scaler
+            # Load feature scaler
             scaler_path = Path(APP_CONFIG['scaler_path'])
             if scaler_path.exists():
                 self.scaler = joblib.load(scaler_path)
-                logger.info(f"✅ Loaded scaler from {scaler_path}")
+                logger.info(f"✅ Loaded feature scaler from {scaler_path}")
             else:
-                logger.warning(f"⚠️ Scaler file not found: {scaler_path}")
+                logger.warning(f"⚠️ Feature scaler file not found: {scaler_path}")
+            
+            # Load target scaler
+            target_scaler_path = Path(APP_CONFIG['target_scaler_path'])
+            if target_scaler_path.exists():
+                self.target_scaler = joblib.load(target_scaler_path)
+                logger.info(f"✅ Loaded target scaler from {target_scaler_path}")
+            else:
+                logger.warning(f"⚠️ Target scaler file not found: {target_scaler_path}")
             
             # Load historical data for stats
             data_path = Path(APP_CONFIG['data_path'])
@@ -265,7 +276,7 @@ class AppState:
         return self.models
     
     def predict_with_model(self, model_name: str, input_sequence: np.ndarray) -> float:
-        """Make prediction with a specific model."""
+        """Make prediction with a specific model and inverse-transform the result."""
         model = self.get_model(model_name)
         if model is None:
             raise ValueError(f"Model '{model_name}' not loaded")
@@ -274,7 +285,16 @@ class AppState:
         if input_sequence.ndim == 2:
             input_sequence = np.expand_dims(input_sequence, axis=0)
         
-        prediction = model.predict(input_sequence, verbose=0)[0][0]
+        prediction_normalized = model.predict(input_sequence, verbose=0)[0][0]
+        
+        # Inverse-transform from normalized [0,1] back to original mm scale
+        if self.target_scaler is not None:
+            prediction = self.target_scaler.inverse_transform(
+                [[float(prediction_normalized)]]
+            )[0][0]
+        else:
+            prediction = float(prediction_normalized)
+        
         return float(prediction)
     
     def calculate_confidence_interval(self, prediction: float, model_name: str) -> tuple:
@@ -447,12 +467,9 @@ async def predict_rainfall(request: PredictionRequest):
         current_features = np.array(recent_features, dtype=np.float32)
         
         for day_offset in range(request.days):
-            # Normalize the sequence
+            # Normalize the sequence: apply per-feature scaler directly on (seq_len, n_features)
             if state.scaler is not None:
-                # Reshape for scaler: (seq_len, n_features) -> (seq_len * n_features,) then back
-                flat = current_features.flatten().reshape(-1, 1)
-                scaled_flat = state.scaler.transform(flat).flatten()
-                scaled_seq = scaled_flat.reshape(current_features.shape)
+                scaled_seq = state.scaler.transform(current_features)
             else:
                 scaled_seq = current_features  # Fallback if no scaler
             
@@ -522,11 +539,9 @@ async def predict_all_models(request: AllModelsRequest):
                 
                 current_features = np.array(recent_features, dtype=np.float32)
                 
-                # Normalize and predict
+                # Normalize and predict: apply per-feature scaler directly on (seq_len, n_features)
                 if state.scaler is not None:
-                    flat = current_features.flatten().reshape(-1, 1)
-                    scaled_flat = state.scaler.transform(flat).flatten()
-                    scaled_seq = scaled_flat.reshape(current_features.shape)
+                    scaled_seq = state.scaler.transform(current_features)
                 else:
                     scaled_seq = current_features
                 
