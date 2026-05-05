@@ -609,7 +609,7 @@ def print_training_summary(results: Dict[str, Dict], elapsed_time: float):
     
     for name, metrics in results.items():
         r2 = metrics['r2']
-        nse = metrics.get('nse', float('nan'))
+        nse = metrics['nse']
         mae = metrics['mae']
         rmse = metrics['rmse']
         mape = metrics['mape']
@@ -629,7 +629,7 @@ def print_training_summary(results: Dict[str, Dict], elapsed_time: float):
     print(f"⏱️  Total Training Time: {elapsed_time/60:.1f} minutes")
     
     # Target check
-    qualified = sum(1 for m in results.values() if m['r2'] >= 0.90 and m.get('nse', 0) >= 0.80)
+    qualified = sum(1 for m in results.values() if m['r2'] >= 0.90 and m['nse'] >= 0.80)
     print(f"🎯 Models with R² ≥ 0.90 and NSE ≥ 0.80: {qualified}/6 (target: ≥4)")
     print("="*100 + "\n")
 
@@ -730,7 +730,7 @@ def main():
     print_training_summary(results, elapsed)
     
     # Final check
-    qualified = sum(1 for m in results.values() if m['r2'] >= 0.90 and m.get('nse', 0) >= 0.80)
+    qualified = sum(1 for m in results.values() if m['r2'] >= 0.90 and m['nse'] >= 0.80)
     if qualified >= 4:
         print("🎉 SUCCESS: Target achieved (≥4 models with R² ≥ 0.90 and NSE ≥ 0.80)!")
     else:
