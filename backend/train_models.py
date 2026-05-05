@@ -56,6 +56,7 @@ CONFIG = {
     'data_path': 'data/dakshina_kannada_weather.csv',
     'models_dir': 'models',
     'scaler_path': 'models/scaler.pkl',
+    'target_scaler_path': 'models/target_scaler.pkl',
     'metrics_path': 'models/metrics.json',
     
     # Sequence parameters
@@ -66,13 +67,13 @@ CONFIG = {
     'batch_size': 32,
     'epochs': 100,
     'patience': 15,  # Early stopping patience
-    'learning_rate': 0.001,
+    'learning_rate': 0.0005,  # Reduced for stability
     'lr_patience': 5,  # ReduceLROnPlateau patience
     'lr_factor': 0.5,
     
     # Architecture defaults
-    'dropout_rate': 0.2,
-    'l2_reg': 0.001,
+    'dropout_rate': 0.3,  # Increased for better regularization
+    'l2_reg': 0.005,  # Tuned for better generalization
     
     # Features to use (excluding date, year, month, day, is_monsoon for raw input)
     'feature_columns': [
@@ -83,14 +84,15 @@ CONFIG = {
 }
 
 
-def load_and_preprocess_data(config: Dict) -> Tuple[np.ndarray, np.ndarray, MinMaxScaler]:
+def load_and_preprocess_data(config: Dict) -> Tuple[np.ndarray, np.ndarray, MinMaxScaler, MinMaxScaler]:
     """
     Load dataset, encode cyclical features, and normalize.
     
     Returns:
         X: Normalized feature array (n_samples, n_features)
-        y: Target rainfall values (n_samples,)
-        scaler: Fitted MinMaxScaler for inverse transform
+        y: Normalized target values (n_samples,)
+        feature_scaler: Fitted MinMaxScaler for features (inverse transform not needed for X)
+        target_scaler: Fitted MinMaxScaler for target (used for inverse transform during evaluation)
     """
     print(f"📁 Loading data from {config['data_path']}...")
     df = pd.read_csv(config['data_path'])
@@ -107,11 +109,15 @@ def load_and_preprocess_data(config: Dict) -> Tuple[np.ndarray, np.ndarray, MinM
     y = df[config['target_column']].values.astype(np.float32)
     
     # Normalize features
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    X_scaled = scaler.fit_transform(X)
+    feature_scaler = MinMaxScaler(feature_range=(0, 1))
+    X_scaled = feature_scaler.fit_transform(X)
+    
+    # Normalize target for stable training; inverse transform during evaluation/inference
+    target_scaler = MinMaxScaler(feature_range=(0, 1))
+    y_scaled = target_scaler.fit_transform(y.reshape(-1, 1)).flatten()
     
     print(f"✅ Loaded {len(df):,} samples with {X.shape[1]} features")
-    return X_scaled, y, scaler
+    return X_scaled, y_scaled, feature_scaler, target_scaler
 
 
 def create_sequences(X: np.ndarray, y: np.ndarray, sequence_length: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -462,23 +468,39 @@ def train_model(
     return history
 
 
-def evaluate_model(model: keras.Model, X_test: np.ndarray, y_test: np.ndarray, 
-                   scaler: MinMaxScaler, feature_cols: List[str]) -> Dict[str, float]:
+def calculate_nse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """
+    Nash-Sutcliffe Efficiency (NSE) coefficient.
+    
+    NSE = 1 - (sum of squared residuals) / (sum of squared deviations from mean)
+    NSE = 1.0: perfect model; NSE < 0: model worse than mean baseline.
+    Target: NSE > 0.800
+    """
+    numerator = np.sum((y_true - y_pred) ** 2)
+    denominator = np.sum((y_true - np.mean(y_true)) ** 2)
+    if denominator == 0:
+        return 1.0 if numerator == 0 else 0.0
+    return float(1.0 - numerator / denominator)
+
+
+def evaluate_model(model: keras.Model, X_test: np.ndarray, y_test: np.ndarray,
+                   target_scaler: MinMaxScaler, feature_cols: List[str]) -> Dict[str, float]:
     """
     Evaluate model on test set and compute metrics.
+    Applies inverse transform to both targets and predictions before metric calculation.
     """
     y_pred = model.predict(X_test, verbose=0).flatten()
     
-    # Inverse transform predictions and targets for metric calculation
-    # Note: Only target needs inverse transform; features were normalized separately
-    y_test_orig = y_test  # Already in original scale
-    y_pred_orig = y_pred  # Model outputs original scale (last layer has no activation)
+    # Inverse-transform from normalized [0,1] back to original mm scale
+    y_test_orig = target_scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
+    y_pred_orig = target_scaler.inverse_transform(y_pred.reshape(-1, 1)).flatten()
     
-    # Calculate metrics
+    # Calculate metrics on original mm scale
     mae = mean_absolute_error(y_test_orig, y_pred_orig)
     rmse = np.sqrt(mean_squared_error(y_test_orig, y_pred_orig))
     r2 = r2_score(y_test_orig, y_pred_orig)
     mape = np.mean(np.abs((y_test_orig - y_pred_orig) / np.maximum(y_test_orig, 0.1))) * 100
+    nse = calculate_nse(y_test_orig, y_pred_orig)
     
     # Count parameters
     total_params = model.count_params()
@@ -488,6 +510,7 @@ def evaluate_model(model: keras.Model, X_test: np.ndarray, y_test: np.ndarray,
         'mae': round(float(mae), 3),
         'rmse': round(float(rmse), 3),
         'r2': round(float(r2), 4),
+        'nse': round(float(nse), 4),
         'mape': round(float(mape), 2),
         'total_params': int(total_params),
         'trainable_params': int(trainable_params)
@@ -575,17 +598,18 @@ def train_autoencoder_pipeline(
 
 def print_training_summary(results: Dict[str, Dict], elapsed_time: float):
     """Print formatted training results table."""
-    print("\n" + "="*90)
+    print("\n" + "="*100)
     print("📊 MODEL TRAINING RESULTS")
-    print("="*90)
-    print(f"{'Model':<15} {'R²':>8} {'MAE (mm)':>12} {'RMSE (mm)':>12} {'MAPE (%)':>10} {'Params':>10}")
-    print("-"*90)
+    print("="*100)
+    print(f"{'Model':<15} {'R²':>8} {'NSE':>8} {'MAE (mm)':>12} {'RMSE (mm)':>12} {'MAPE (%)':>10} {'Params':>10}")
+    print("-"*100)
     
     best_model = None
     best_r2 = -1
     
     for name, metrics in results.items():
         r2 = metrics['r2']
+        nse = metrics.get('nse', float('nan'))
         mae = metrics['mae']
         rmse = metrics['rmse']
         mape = metrics['mape']
@@ -597,17 +621,17 @@ def print_training_summary(results: Dict[str, Dict], elapsed_time: float):
             best_r2 = r2
             best_model = name
         
-        status = "✅" if r2 >= 0.88 and mae <= 8 else "⚠️"
-        print(f"{name:<15} {r2:>8.4f} {mae:>12.3f} {rmse:>12.3f} {mape:>10.2f} {params:>10} {status}{marker}")
+        status = "✅" if r2 >= 0.88 and mae <= 8 and nse >= 0.8 else "⚠️"
+        print(f"{name:<15} {r2:>8.4f} {nse:>8.4f} {mae:>12.3f} {rmse:>12.3f} {mape:>10.2f} {params:>10} {status}{marker}")
     
-    print("-"*90)
+    print("-"*100)
     print(f"✨ Best Model: {best_model} (R² = {best_r2:.4f})")
     print(f"⏱️  Total Training Time: {elapsed_time/60:.1f} minutes")
     
     # Target check
-    qualified = sum(1 for m in results.values() if m['r2'] >= 0.90)
-    print(f"🎯 Models with R² ≥ 0.90: {qualified}/6 (target: ≥4)")
-    print("="*90 + "\n")
+    qualified = sum(1 for m in results.values() if m['r2'] >= 0.90 and m.get('nse', 0) >= 0.80)
+    print(f"🎯 Models with R² ≥ 0.90 and NSE ≥ 0.80: {qualified}/6 (target: ≥4)")
+    print("="*100 + "\n")
 
 
 def main():
@@ -622,12 +646,14 @@ def main():
     print("="*90)
     
     # Step 1: Load and preprocess data
-    X_raw, y_raw, scaler = load_and_preprocess_data(CONFIG)
+    X_raw, y_raw, feature_scaler, target_scaler = load_and_preprocess_data(CONFIG)
     
-    # Save scaler for inference
+    # Save both scalers for inference
     import joblib
-    joblib.dump(scaler, CONFIG['scaler_path'])
-    print(f"💾 Scaler saved to {CONFIG['scaler_path']}")
+    joblib.dump(feature_scaler, CONFIG['scaler_path'])
+    joblib.dump(target_scaler, CONFIG['target_scaler_path'])
+    print(f"💾 Feature scaler saved to {CONFIG['scaler_path']}")
+    print(f"💾 Target scaler saved to {CONFIG['target_scaler_path']}")
     
     # Step 2: Create sequences
     print(f"🔗 Creating {CONFIG['sequence_length']}-day sequences...")
@@ -665,7 +691,7 @@ def main():
         compile_model(model)
         
         history = train_model(model, X_train, y_train, X_val, y_val, name)
-        metrics = evaluate_model(model, X_test, y_test, scaler, CONFIG['feature_columns'])
+        metrics = evaluate_model(model, X_test, y_test, target_scaler, CONFIG['feature_columns'])
         metrics['training_time'] = round(time.time() - start_time, 1)
         
         # Save model
@@ -683,7 +709,7 @@ def main():
     
     clear_session()
     regressor = train_autoencoder_pipeline(X_train, y_train, X_val, y_val, input_shape)
-    metrics = evaluate_model(regressor, X_test, y_test, scaler, CONFIG['feature_columns'])
+    metrics = evaluate_model(regressor, X_test, y_test, target_scaler, CONFIG['feature_columns'])
     metrics['training_time'] = round(time.time() - start_time, 1)
     
     # Save model
@@ -704,11 +730,11 @@ def main():
     print_training_summary(results, elapsed)
     
     # Final check
-    qualified = sum(1 for m in results.values() if m['r2'] >= 0.90)
+    qualified = sum(1 for m in results.values() if m['r2'] >= 0.90 and m.get('nse', 0) >= 0.80)
     if qualified >= 4:
-        print("🎉 SUCCESS: Target achieved (≥4 models with R² ≥ 0.90)!")
+        print("🎉 SUCCESS: Target achieved (≥4 models with R² ≥ 0.90 and NSE ≥ 0.80)!")
     else:
-        print(f"⚠️  Note: {qualified}/6 models achieved R² ≥ 0.90. Consider hyperparameter tuning.")
+        print(f"⚠️  Note: {qualified}/6 models achieved R² ≥ 0.90 and NSE ≥ 0.80. Consider hyperparameter tuning.")
     
     print(f"\n✨ Training complete! Next: Start backend with `uvicorn main:app --reload`")
     
