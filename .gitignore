@@ -1,0 +1,4 @@
+/backend/models
+/backend/generate_data.py
+/frontend/node_modules
+/frontend/package-lock.json
